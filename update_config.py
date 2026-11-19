@@ -1,10 +1,12 @@
 import ipaddress
 import json
+import os
 import re
 import socket
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
+from functools import lru_cache, partial
+from hashlib import sha256
 from http.client import HTTPException
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -25,13 +27,25 @@ JSON_STRING = r'"(?:\\[\s\S]|[^"\\])*"'
 COMMENTS = re.compile(JSON_STRING + r'|//[^\r\n]*|/\*[\s\S]*?\*/')
 TRAILING_COMMAS = re.compile(JSON_STRING + r'|,(?=\s*[}\]])')
 EMBEDDED_URL = re.compile(r'(https?://[^/]+/)(https?://.+)')
-GITHUB_MIRRORS = {"gh-proxy.com", "gh-proxy.org", "ghproxy.net"}
+GITHUB_RAW_HOST = "raw.githubusercontent.com"
+GITHUB_PROXY_PATH = re.compile(
+    r"/+(?:https?:/{1,2})?raw\.githubusercontent\.com/+(.*)", re.IGNORECASE
+)
+GITHUB_BRANCH_URL = re.compile(r"^(https://raw\.githubusercontent\.com/[^/]+/[^/]+)/refs/heads/")
+README_LINKS_START = "<!-- tv-config-links:start -->"
+README_LINKS_END = "<!-- tv-config-links:end -->"
 REQUEST_ERRORS = (OSError, ValueError, HTTPException, RecursionError)
 
 
 class Source(NamedTuple):
     name: str
     url: str
+
+
+class CheckedSource(NamedTuple):
+    url: str
+    children: list[Source]
+    digest: bytes
 
 
 def resolve_url(value: str, base: str = "") -> str:
@@ -134,14 +148,36 @@ def catalog_sources(config: dict, base: str = "") -> list[Source]:
     return sources
 
 
-def github_raw_mirror(url: str) -> str | None:
+def github_raw_url(url: str) -> str | None:
     parts = urlsplit(url)
-    if parts.hostname not in GITHUB_MIRRORS:
+    path = parts.path
+    if parts.hostname != GITHUB_RAW_HOST:
+        match = GITHUB_PROXY_PATH.fullmatch(path)
+        if not match:
+            return None
+        path = "/" + match[1]
+    if len(path.strip("/").split("/", 3)) < 4:
         return None
-    match = re.fullmatch(r"/(?:https?:/{1,2})?raw\.githubusercontent\.com/+(.*)", parts.path)
-    if not match:
-        return None
-    return urlunsplit(("https", "raw.githubusercontent.com", "/" + match[1], parts.query, ""))
+    return urlunsplit(("https", GITHUB_RAW_HOST, path, parts.query, ""))
+
+
+def source_key(url: str) -> str:
+    raw = github_raw_url(url)
+    return GITHUB_BRANCH_URL.sub(r"\1/", raw) if raw else url
+
+
+def configured_proxy_prefixes(config: dict) -> tuple[str, ...]:
+    entries = config.get("githubProxyPrefixes", [])
+    if not isinstance(entries, list) or any(not isinstance(entry, str) for entry in entries):
+        raise ValueError("githubProxyPrefixes 需要是 HTTPS 前缀数组")
+    prefixes = []
+    for entry in entries:
+        url = resolve_url(entry)
+        parts = urlsplit(url)
+        if parts.scheme != "https" or parts.path != "/" or parts.query:
+            raise ValueError("加速前缀需要是 HTTPS 站点根地址")
+        prefixes.append(url)
+    return tuple(dict.fromkeys(prefixes))
 
 
 @lru_cache(maxsize=512)
@@ -183,119 +219,184 @@ def check_sites(config: dict, base: str) -> None:
     raise ValueError("声明的 Spider/JAR 均未通过下载检查")
 
 
-def inspect_source(url: str) -> list[Source]:
-    """Return catalog entries, or an empty list for a usable VOD config."""
+def inspect_source(url: str, expected_digest: bytes | None = None) -> CheckedSource:
     body, final_url = fetch(url, MAX_CONFIG_SIZE + 1)
     if len(body) > MAX_CONFIG_SIZE:
         raise ValueError("配置文件超过 4 MiB")
+    if (
+        urlsplit(url).hostname != GITHUB_RAW_HOST
+        and github_raw_url(url)
+        and urlsplit(final_url).hostname == GITHUB_RAW_HOST
+    ):
+        raise ValueError("加速地址跳转到了 GitHub Raw")
+    digest = sha256(body).digest()
+    if expected_digest is not None and digest != expected_digest:
+        raise ValueError("返回内容与原文件版本不一致")
     config = parse_config(body)
     if "storeHouse" in config or "urls" in config:
         children = catalog_sources(config, final_url)
         if not children:
             raise ValueError("仓库目录没有可检查的地址")
-        return children
-    check_sites(config, final_url)
-    return []
+    else:
+        check_sites(config, final_url)
+        children = []
+    return CheckedSource(url, children, digest)
 
 
-def probe(source: Source) -> tuple[str, list[Source]] | None:
-    attempts = [source.url]
-    mirror = github_raw_mirror(source.url)
-    if mirror:
-        attempts.append(mirror)
-
-    failures = []
-    for url in attempts:
-        try:
-            return url, inspect_source(url)
-        except HTTPError as error:
-            reason = f"HTTP {error.code}"
-        except (UnicodeError, json.JSONDecodeError):
-            reason = "响应不是可解析的 JSON"
-        except (OSError, HTTPException):
-            reason = "连接失败或超时"
-        except RecursionError:
-            reason = "JSON 嵌套过深"
-        except ValueError as error:
-            reason = str(error)
-        failures.append(f"{urlsplit(url).hostname}: {reason}")
-
-    print(f"跳过 {source.name}（{'；'.join(failures)}）")
+def try_source(
+    url: str, failures: list[str], expected_digest: bytes | None = None
+) -> CheckedSource | None:
+    try:
+        return inspect_source(url, expected_digest)
+    except HTTPError as error:
+        reason = f"HTTP {error.code}"
+    except (UnicodeError, json.JSONDecodeError):
+        reason = "响应不是可解析的 JSON"
+    except (OSError, HTTPException):
+        reason = "连接失败或超时"
+    except RecursionError:
+        reason = "JSON 嵌套过深"
+    except ValueError as error:
+        reason = str(error)
+    failures.append(f"{urlsplit(url).hostname}: {reason}")
     return None
 
 
-def find_routes(seeds: list[Source]) -> list[Source]:
+def probe(source: Source, proxy_prefixes: tuple[str, ...]) -> CheckedSource | None:
+    failures = []
+    raw = github_raw_url(source.url)
+    direct = try_source(raw or source.url, failures)
+    if raw and (direct is None or not direct.children):
+        expected = direct.digest if direct else None
+        candidates = [prefix + raw for prefix in proxy_prefixes]
+        if source.url != raw:
+            candidates.append(source.url)
+        for url in dict.fromkeys(candidates):
+            accelerated = try_source(url, failures, expected)
+            if accelerated:
+                return accelerated
+
+    if direct is None:
+        print(f"跳过 {source.name}（{'；'.join(failures)}）")
+    return direct
+
+
+def find_routes(seeds: list[Source], proxy_prefixes: tuple[str, ...] = ()) -> list[Source]:
     pending = [((index,), source) for index, source in enumerate(seeds)]
     checked = {}
     positions = {}
     usable = []
+    check = partial(probe, proxy_prefixes=proxy_prefixes)
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         for _ in range(MAX_DEPTH + 1):
             batch = []
             for position, source in sorted(pending):
-                if source.url in positions and positions[source.url] <= position:
+                key = source_key(source.url)
+                if key in positions and positions[key] <= position:
                     continue
-                positions[source.url] = position
-                batch.append((position, source))
+                positions[key] = position
+                batch.append((position, key, source))
             if not batch:
                 break
 
-            new = {source.url: source for _, source in batch if source.url not in checked}
-            requests = list(new.values())[:MAX_URLS - len(checked)]
-            for source, result in zip(requests, executor.map(probe, requests)):
-                checked[source.url] = result
+            new = [(key, source) for _, key, source in batch if key not in checked]
+            requests = new[:MAX_URLS - len(checked)]
+            results = executor.map(check, (source for _, source in requests))
+            for (key, _), result in zip(requests, results):
+                checked[key] = result
 
             pending = []
-            for position, source in batch:
-                result = checked.get(source.url)
+            for position, key, source in batch:
+                result = checked.get(key)
                 if result is None:
                     continue
-                url, children = result
-                if children:
-                    pending.extend((position + (index,), child) for index, child in enumerate(children))
+                if result.children:
+                    pending.extend(
+                        (position + (index,), child) for index, child in enumerate(result.children)
+                    )
                 else:
-                    usable.append((position, Source(source.name, url)))
+                    usable.append((position, key, Source(source.name, result.url)))
 
     unique = {}
-    for _, source in sorted(usable):
-        unique.setdefault(source.url, source)
+    for _, key, source in sorted(usable):
+        unique.setdefault(key, source)
     print(f"检查了 {len(checked)} 个目录或线路地址，{len(unique)} 条线路通过检查。")
     return list(unique.values())[:MAX_ROUTES]
 
 
-def update_config(seeds_path: Path, output_path: Path) -> int:
-    seeds = catalog_sources(parse_config(seeds_path.read_bytes()))
+def readme_with_links(
+    readme: str, public_url: str, proxy_prefixes: tuple[str, ...], published_digest: bytes | None
+) -> str:
+    head, start, tail = readme.partition(README_LINKS_START)
+    _, end, rest = tail.partition(README_LINKS_END)
+    if not start or not end:
+        raise ValueError("README 缺少配置链接区的标记")
+
+    links = [f"- [GitHub Raw 固定入口]({public_url})"]
+    if published_digest is not None:
+        for prefix in proxy_prefixes:
+            url = prefix + public_url
+            failures = []
+            result = try_source(url, failures, published_digest)
+            if result and result.children:
+                links.append(f"- [{urlsplit(prefix).hostname} 加速入口]({url})")
+            elif failures:
+                print(f"README 加速入口未通过（{'；'.join(failures)}）")
+    newline = "\r\n" if "\r\n" in readme else "\n"
+    return head + (newline * 2).join((start, newline.join(links), end)) + rest
+
+
+def write_if_changed(path: Path, payload: bytes) -> bool:
+    if path.is_file() and path.read_bytes() == payload:
+        return False
+    with NamedTemporaryFile(dir=path.parent, delete=False) as file:
+        temporary = Path(file.name)
+        try:
+            file.write(payload)
+            file.close()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return True
+
+
+def update_config(seeds_path: Path, output_path: Path, public_url: str | None = None) -> int:
+    settings = parse_config(seeds_path.read_bytes())
+    seeds = catalog_sources(settings)
     if not seeds:
         raise ValueError("sources.json 缺少有效的候选目录")
+    proxy_prefixes = configured_proxy_prefixes(settings)
 
     require_public_host.cache_clear()
     jar_available.cache_clear()
-    routes = find_routes(seeds)
+    routes = find_routes(seeds, proxy_prefixes)
     if not routes:
         print("没有线路通过检查，保留上一次发布的配置。", file=sys.stderr)
         return 1
 
     config = {"urls": [source._asdict() for source in routes]}
     payload = (json.dumps(config, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    if output_path.is_file() and output_path.read_bytes() == payload:
-        print(f"{output_path.name} 已是最新配置。")
-        return 0
+    if public_url:
+        # Check the published version before replacing the checkout's tv.json.
+        published_digest = sha256(output_path.read_bytes()).digest() if output_path.is_file() else None
+        readme_path = output_path.with_name("README.md")
+        readme = readme_path.read_bytes().decode("utf-8")
+        readme = readme_with_links(readme, resolve_url(public_url), proxy_prefixes, published_digest)
+        if write_if_changed(readme_path, readme.encode("utf-8")):
+            print("已更新 README 配置地址。")
 
-    with NamedTemporaryFile(dir=output_path.parent, delete=False) as file:
-        temporary = Path(file.name)
-        try:
-            file.write(payload)
-            file.close()
-            temporary.replace(output_path)
-        finally:
-            temporary.unlink(missing_ok=True)
-    print(f"已生成 {output_path.name}，首选线路为 {routes[0].name}。")
+    if write_if_changed(output_path, payload):
+        print(f"已生成 {output_path.name}，首选线路为 {routes[0].name}。")
+    else:
+        print(f"{output_path.name} 已是最新配置。")
     return 0
 
 
 if __name__ == "__main__":
     try:
-        sys.exit(update_config(DIRECTORY / "sources.json", DIRECTORY / "tv.json"))
+        sys.exit(
+            update_config(DIRECTORY / "sources.json", DIRECTORY / "tv.json", os.environ.get("TV_CONFIG_URL"))
+        )
     except (OSError, ValueError) as error:
         sys.exit(f"更新失败：{error}")

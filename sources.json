@@ -1,12 +1,13 @@
 {
+  "githubProxyPrefixes": [
+    "https://gh-proxy.com/",
+    "https://ghproxy.net/",
+    "https://ghfast.top/"
+  ],
   "urls": [
     {
       "name": "无邪影视仓",
       "url": "https://raw.githubusercontent.com/wxrjck/-YSC-/refs/heads/main/wx.json"
-    },
-    {
-      "name": "无邪影视仓（你当前的地址）",
-      "url": "https://gh-proxy.com/https://raw.githubusercontent.com/wxrjck/-YSC-/refs/heads/main/wx.json"
     },
     {
       "name": "noimank/tvbox",
