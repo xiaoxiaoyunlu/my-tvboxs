@@ -1,0 +1,24 @@
+{
+  "urls": [
+    {
+      "name": "无邪影视仓",
+      "url": "https://raw.githubusercontent.com/wxrjck/-YSC-/refs/heads/main/wx.json"
+    },
+    {
+      "name": "无邪影视仓（你当前的地址）",
+      "url": "https://gh-proxy.com/https://raw.githubusercontent.com/wxrjck/-YSC-/refs/heads/main/wx.json"
+    },
+    {
+      "name": "noimank/tvbox",
+      "url": "https://raw.githubusercontent.com/noimank/tvbox/main/tvboxmuti.json"
+    },
+    {
+      "name": "noimank/tvbox（GitLab）",
+      "url": "https://gitlab.com/noimank/tvbox/-/raw/main/tvboxmuti.json"
+    },
+    {
+      "name": "gitoscc/maintv",
+      "url": "https://raw.githubusercontent.com/gitoscc/maintv/main/x.json"
+    }
+  ]
+}
