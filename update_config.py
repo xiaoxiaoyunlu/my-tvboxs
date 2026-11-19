@@ -333,18 +333,19 @@ def readme_with_links(
     if not start or not end:
         raise ValueError("README 缺少配置链接区的标记")
 
-    links = [f"- [GitHub Raw 固定入口]({public_url})"]
+    links = [("GitHub Raw 固定入口", public_url)]
     if published_digest is not None:
         for prefix in proxy_prefixes:
             url = prefix + public_url
             failures = []
             result = try_source(url, failures, published_digest)
             if result and result.children:
-                links.append(f"- [{urlsplit(prefix).hostname} 加速入口]({url})")
+                links.append((f"{urlsplit(prefix).hostname} 加速入口", url))
             elif failures:
                 print(f"README 加速入口未通过（{'；'.join(failures)}）")
     newline = "\r\n" if "\r\n" in readme else "\n"
-    return head + (newline * 2).join((start, newline.join(links), end)) + rest
+    blocks = [newline.join((f"**{label}**", "", "```text", url, "```")) for label, url in links]
+    return head + (newline * 2).join((start, *blocks, end)) + rest
 
 
 def write_if_changed(path: Path, payload: bytes) -> bool:
