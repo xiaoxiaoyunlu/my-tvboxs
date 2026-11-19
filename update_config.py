@@ -325,6 +325,46 @@ def find_routes(seeds: list[Source], proxy_prefixes: tuple[str, ...] = ()) -> li
     return list(unique.values())[:MAX_ROUTES]
 
 
+def read_published_routes(payload: bytes) -> list[Source]:
+    try:
+        entries = parse_config(payload).get("urls")
+    except (ValueError, RecursionError):
+        return []
+    if not isinstance(entries, list):
+        return []
+    routes = catalog_sources({"urls": entries})
+    return routes if len(routes) == len(entries) else []
+
+
+def published_route_error(source: Source) -> str | None:
+    failures = []
+    result = try_source(source.url, failures)
+    if result is None:
+        return "；".join(failures)
+    if result.children:
+        return "配置地址变成了仓库目录"
+    return None
+
+
+def check_published_routes(routes: list[Source]) -> list[Source]:
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        retry = [
+            source for source, error in zip(routes, executor.map(published_route_error, routes))
+            if error is not None
+        ]
+        if not retry:
+            return routes
+
+        jar_available.cache_clear()
+        print(f"有 {len(retry)} 条已发布线路首次检查失败，开始复查。")
+        failed = set()
+        for source, error in zip(retry, executor.map(published_route_error, retry)):
+            if error is not None:
+                failed.add(source)
+                print(f"已发布线路失效 {source.name}（{error}）")
+    return [source for source in routes if source not in failed]
+
+
 def readme_with_links(
     readme: str, public_url: str, proxy_prefixes: tuple[str, ...], published_digest: bytes | None
 ) -> str:
@@ -362,25 +402,41 @@ def write_if_changed(path: Path, payload: bytes) -> bool:
     return True
 
 
-def update_config(seeds_path: Path, output_path: Path, public_url: str | None = None) -> int:
+def update_config(
+    seeds_path: Path, output_path: Path, public_url: str | None = None, *, check_existing: bool = False
+) -> int:
     settings = parse_config(seeds_path.read_bytes())
     seeds = catalog_sources(settings)
     if not seeds:
         raise ValueError("sources.json 缺少有效的候选目录")
     proxy_prefixes = configured_proxy_prefixes(settings)
 
+    published_payload = output_path.read_bytes() if output_path.is_file() else None
     require_public_host.cache_clear()
     jar_available.cache_clear()
-    routes = find_routes(seeds, proxy_prefixes)
-    if not routes:
-        print("没有线路通过检查，保留上一次发布的配置。", file=sys.stderr)
-        return 1
+    published = read_published_routes(published_payload) if check_existing and published_payload else []
+    routes = check_published_routes(published) if published else []
+    if published_payload is not None and published and len(routes) == len(published):
+        print(f"已发布的 {len(routes)} 条线路均通过检查，跳过上游抓取。")
+        payload = published_payload
+    else:
+        if check_existing:
+            jar_available.cache_clear()
+            print("开始从上游查找可用线路。" if published else "缺少有效的已发布配置，开始从上游查找线路。")
+        discovered = find_routes(seeds, proxy_prefixes)
+        if not discovered and routes:
+            print(f"上游没有新选出的线路，继续使用 {len(routes)} 条通过检查的现有线路。")
+        routes = discovered or routes
+        if not routes:
+            print("没有线路通过检查，保留上一次发布的配置。", file=sys.stderr)
+            return 1
 
-    config = {"urls": [source._asdict() for source in routes]}
-    payload = (json.dumps(config, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        config = {"urls": [source._asdict() for source in routes]}
+        payload = (json.dumps(config, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
     if public_url:
         # Check the published version before replacing the checkout's tv.json.
-        published_digest = sha256(output_path.read_bytes()).digest() if output_path.is_file() else None
+        published_digest = sha256(published_payload).digest() if published_payload is not None else None
         readme_path = output_path.with_name("README.md")
         readme = readme_path.read_bytes().decode("utf-8")
         readme = readme_with_links(readme, resolve_url(public_url), proxy_prefixes, published_digest)
@@ -397,7 +453,12 @@ def update_config(seeds_path: Path, output_path: Path, public_url: str | None = 
 if __name__ == "__main__":
     try:
         sys.exit(
-            update_config(DIRECTORY / "sources.json", DIRECTORY / "tv.json", os.environ.get("TV_CONFIG_URL"))
+            update_config(
+                DIRECTORY / "sources.json",
+                DIRECTORY / "tv.json",
+                os.environ.get("TV_CONFIG_URL"),
+                check_existing=os.environ.get("GITHUB_EVENT_NAME") == "schedule",
+            )
         )
     except (OSError, ValueError) as error:
         sys.exit(f"更新失败：{error}")
