@@ -7,9 +7,29 @@
 
 <!-- tv-config-links:start -->
 
-- [GitHub Raw 固定入口](https://raw.githubusercontent.com/xiaoxiaoyunlu/my-tvboxs/main/tv.json)
-- [gh-proxy.com 加速入口](https://gh-proxy.com/https://raw.githubusercontent.com/xiaoxiaoyunlu/my-tvboxs/main/tv.json)
-- [ghfast.top 加速入口](https://ghfast.top/https://raw.githubusercontent.com/xiaoxiaoyunlu/my-tvboxs/main/tv.json)
+**GitHub Raw 固定入口**
+
+```text
+https://raw.githubusercontent.com/xiaoxiaoyunlu/my-tvboxs/main/tv.json
+```
+
+**gh-proxy.com 加速入口**
+
+```text
+https://gh-proxy.com/https://raw.githubusercontent.com/xiaoxiaoyunlu/my-tvboxs/main/tv.json
+```
+
+**ghproxy.net 加速入口**
+
+```text
+https://ghproxy.net/https://raw.githubusercontent.com/xiaoxiaoyunlu/my-tvboxs/main/tv.json
+```
+
+**ghfast.top 加速入口**
+
+```text
+https://ghfast.top/https://raw.githubusercontent.com/xiaoxiaoyunlu/my-tvboxs/main/tv.json
+```
 
 <!-- tv-config-links:end -->
 
