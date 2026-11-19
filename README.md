@@ -8,6 +8,8 @@
 <!-- tv-config-links:start -->
 
 - [GitHub Raw 固定入口](https://raw.githubusercontent.com/xiaoxiaoyunlu/my-tvboxs/main/tv.json)
+- [gh-proxy.com 加速入口](https://gh-proxy.com/https://raw.githubusercontent.com/xiaoxiaoyunlu/my-tvboxs/main/tv.json)
+- [ghfast.top 加速入口](https://ghfast.top/https://raw.githubusercontent.com/xiaoxiaoyunlu/my-tvboxs/main/tv.json)
 
 <!-- tv-config-links:end -->
 
