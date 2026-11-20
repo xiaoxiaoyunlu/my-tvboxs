@@ -19,6 +19,12 @@ https://raw.githubusercontent.com/xiaoxiaoyunlu/my-tvboxs/main/tv.json
 https://gh-proxy.com/https://raw.githubusercontent.com/xiaoxiaoyunlu/my-tvboxs/main/tv.json
 ```
 
+**ghproxy.net 加速入口**
+
+```text
+https://ghproxy.net/https://raw.githubusercontent.com/xiaoxiaoyunlu/my-tvboxs/main/tv.json
+```
+
 **ghfast.top 加速入口**
 
 ```text
