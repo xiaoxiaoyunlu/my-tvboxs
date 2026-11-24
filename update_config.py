@@ -21,6 +21,7 @@ MAX_CONFIG_SIZE = 4 * 1024 * 1024
 MAX_DEPTH = 4
 MAX_URLS = 160
 MAX_ROUTES = 8
+MIN_AVAILABLE_PERCENT = 60
 REQUEST_TIMEOUT = 7
 
 JSON_STRING = r'"(?:\\[\s\S]|[^"\\])*"'
@@ -365,8 +366,40 @@ def check_published_routes(routes: list[Source]) -> list[Source]:
     return [source for source in routes if source not in failed]
 
 
+def repair_published_routes(
+    published: list[Source], healthy: list[Source], discovered: list[Source]
+) -> list[Source]:
+    healthy_sources = set(healthy)
+    published_keys = {source_key(source.url) for source in published}
+    candidates = {source_key(source.url): source for source in discovered}
+    unused = iter(source for key, source in candidates.items() if key not in published_keys)
+    routes = []
+    for source in published:
+        if source in healthy_sources:
+            routes.append(source)
+            continue
+        alternate = candidates.get(source_key(source.url))
+        if alternate is not None:
+            routes.append(Source(source.name, alternate.url))
+        else:
+            routes.append(next(unused, source))
+    return routes
+
+
+def check_readme_proxy(url: str, published: list[Source]) -> bool:
+    failures = []
+    for _ in range(2):
+        result = try_source(url, failures)
+        if result is not None:
+            if result.children == published:
+                return True
+            failures.append(f"{urlsplit(url).hostname}: 返回的线路列表与已发布配置不同")
+    print(f"README 加速入口未通过（{'；'.join(dict.fromkeys(failures))}）")
+    return False
+
+
 def readme_with_links(
-    readme: str, public_url: str, proxy_prefixes: tuple[str, ...], published_digest: bytes | None
+    readme: str, public_url: str, proxy_prefixes: tuple[str, ...], published: list[Source]
 ) -> str:
     head, start, tail = readme.partition(README_LINKS_START)
     _, end, rest = tail.partition(README_LINKS_END)
@@ -374,15 +407,11 @@ def readme_with_links(
         raise ValueError("README 缺少配置链接区的标记")
 
     links = [("GitHub Raw 固定入口", public_url)]
-    if published_digest is not None:
+    if published:
         for prefix in proxy_prefixes:
             url = prefix + public_url
-            failures = []
-            result = try_source(url, failures, published_digest)
-            if result and result.children:
+            if check_readme_proxy(url, published):
                 links.append((f"{urlsplit(prefix).hostname} 加速入口", url))
-            elif failures:
-                print(f"README 加速入口未通过（{'；'.join(failures)}）")
     newline = "\r\n" if "\r\n" in readme else "\n"
     blocks = [newline.join((f"**{label}**", "", "```text", url, "```")) for label, url in links]
     return head + (newline * 2).join((start, *blocks, end)) + rest
@@ -405,41 +434,51 @@ def write_if_changed(path: Path, payload: bytes) -> bool:
 def update_config(
     seeds_path: Path, output_path: Path, public_url: str | None = None, *, check_existing: bool = False
 ) -> int:
+    published_payload = output_path.read_bytes() if output_path.is_file() else None
+    published = read_published_routes(published_payload) if published_payload else []
+    require_public_host.cache_clear()
+    jar_available.cache_clear()
+
+    healthy = []
+    if check_existing and published:
+        healthy = check_published_routes(published)
+        available = len(healthy)
+        total = len(published)
+        print(f"已发布线路可用率 {available}/{total}（{available * 100 / total:.1f}%）。")
+        if available * 100 >= total * MIN_AVAILABLE_PERCENT:
+            print(f"可用率达到 {MIN_AVAILABLE_PERCENT}%，跳过上游抓取和写回。")
+            return 0
+        print(f"可用率低于 {MIN_AVAILABLE_PERCENT}%，开始从上游查找替代线路。")
+        jar_available.cache_clear()
+
     settings = parse_config(seeds_path.read_bytes())
     seeds = catalog_sources(settings)
     if not seeds:
         raise ValueError("sources.json 缺少有效的候选目录")
     proxy_prefixes = configured_proxy_prefixes(settings)
+    discovered = find_routes(seeds, proxy_prefixes)
+    if not discovered and not healthy:
+        print("没有线路通过检查，保留上一次发布的配置。", file=sys.stderr)
+        return 1
 
-    published_payload = output_path.read_bytes() if output_path.is_file() else None
-    require_public_host.cache_clear()
-    jar_available.cache_clear()
-    published = read_published_routes(published_payload) if check_existing and published_payload else []
-    routes = check_published_routes(published) if published else []
-    if published_payload is not None and published and len(routes) == len(published):
-        print(f"已发布的 {len(routes)} 条线路均通过检查，跳过上游抓取。")
+    if check_existing and published:
+        routes = repair_published_routes(published, healthy, discovered)
+        if routes == published:
+            print("没有需要写回的替代线路，保留已发布配置。")
+            return 0
+    else:
+        routes = discovered
+
+    if published_payload is not None and routes == published:
         payload = published_payload
     else:
-        if check_existing:
-            jar_available.cache_clear()
-            print("开始从上游查找可用线路。" if published else "缺少有效的已发布配置，开始从上游查找线路。")
-        discovered = find_routes(seeds, proxy_prefixes)
-        if not discovered and routes:
-            print(f"上游没有新选出的线路，继续使用 {len(routes)} 条通过检查的现有线路。")
-        routes = discovered or routes
-        if not routes:
-            print("没有线路通过检查，保留上一次发布的配置。", file=sys.stderr)
-            return 1
-
         config = {"urls": [source._asdict() for source in routes]}
         payload = (json.dumps(config, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
     if public_url:
-        # Check the published version before replacing the checkout's tv.json.
-        published_digest = sha256(published_payload).digest() if published_payload is not None else None
         readme_path = output_path.with_name("README.md")
         readme = readme_path.read_bytes().decode("utf-8")
-        readme = readme_with_links(readme, resolve_url(public_url), proxy_prefixes, published_digest)
+        readme = readme_with_links(readme, resolve_url(public_url), proxy_prefixes, published)
         if write_if_changed(readme_path, readme.encode("utf-8")):
             print("已更新 README 配置地址。")
 
@@ -457,7 +496,7 @@ if __name__ == "__main__":
                 DIRECTORY / "sources.json",
                 DIRECTORY / "tv.json",
                 os.environ.get("TV_CONFIG_URL"),
-                check_existing=os.environ.get("GITHUB_EVENT_NAME") == "schedule",
+                check_existing=os.environ.get("GITHUB_ACTIONS") == "true",
             )
         )
     except (OSError, ValueError) as error:

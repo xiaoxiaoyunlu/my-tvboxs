@@ -37,6 +37,7 @@ jobs:
         run: |
           git add -- tv.json README.md
           if git diff --cached --quiet; then
+            echo 'No configuration changes to publish.'
             exit 0
           fi
           git -c user.name='github-actions[bot]' \
